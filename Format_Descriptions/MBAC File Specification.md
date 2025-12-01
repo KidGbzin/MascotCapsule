@@ -14,7 +14,7 @@ MBAC is a compact 3D model format used primarily in Mascot Capsule engines. It s
 * Normals (spherical encoding);
 * Flat and textured polygons;
 * Bone hierarchy and transformations;
-* Material/color metadata (not yet full covered).
+* Material/color metadata (not fully covered yet).
 
 All transformations and matrices in MBAC use **4.12 fixed‑point format** (1 unit = 4096).
 
@@ -66,38 +66,43 @@ The material block structure is not fully understood. It consists of:
 
 These values are read and discarded since no MBAC tested uses materials.
 
+``` 
+repeat unknown_bits_21 times:
+    uint16 unknown_1
+    uint16 unknown_2
+
+    repeat number_of_materials times:
+        uint16 unknown_3
+        uint16 unknown_4
+```
+
 ---
 
 ## Vertex Decompression
 
-Vertices are read through a custom bitstream using the `Unpacker` helper.
+When an MBAC file uses vertex format `2`, all vertices are stored inside a compressed bitstream. The bitstream is divided into blocks, and each block begins with a 1-byte header.
 
-Each vertex block begins with:
+The two most significant bits of this header determine the magnitude, which specifies how many bits are used to store each coordinate (X, Y, Z) inside that block.
 
-```
-8-bit header:
-    top 2 bits = magnitude index (0-3)
-    low 6 bits = count-1 of vertices in this block
-```
+The magnitude therefore defines the bit-width and numeric range for all vertices encoded in the block.
 
-Magnitude determines the bit-width of each coordinate:
+| Magnitude | Code | Bits per Coordenate | Signed Type   | Numeric Range     |
+| --------- | ---- | ------------------- | ------------- | ----------------- |
+| 0         | 8    | 8 bits              | sint8         | -128 to +127      |
+| 1         | 10   | 10 bits             | sint10        | -512 to +511      |
+| 2         | 13   | 13 bits             | sint13        | -4096 to +4095    |
+| 3         | 16   | 16 bits             | sint16        | -32768 to +32767  |
 
-```
-0 → 8 bits
-1 → 10 bits
-2 → 13 bits
-3 → 16 bits
-```
+---
 
-Every vertex contains:
+#### Why magnitudes exist?
 
-```
-X (signed)
-Y (signed)
-Z (signed)
-```
+Using different magnitudes allows the MBAC encoder to automatically choose the smallest possible precision for each block of vertices:
 
-Coordinates are integers, not scaled (i.e., raw model-space units).
+- Small details: 8 or 10 bits;
+- Larger structures: 13 or 16 bits.
+
+This significantly reduces file size while maintaining enough precision for rendering.
 
 ---
 
@@ -105,31 +110,84 @@ Coordinates are integers, not scaled (i.e., raw model-space units).
 
 Normals use a custom spherical encoding.
 
-### Special Case: Axis-Aligned Normals
+When an MBAC file uses normal format `2`, all surface normals are stored using a compact spherical encoding.
 
-If `x_raw == -64`, then the next 3 bits encode one of six axis directions:
+Unlike vertices (which store X, Y, Z explicitly), this encoding reduces a normal vector to just 15 bits, instead of 36 bytes used by three floats.
 
-```
-+X, -X, +Y, -Y, +Z, -Z
-```
+This compression works by storing only:
 
-Values returned are floating point unit vectors.
+- X (7-bit signed);
+- Y (7-bit signed);
+- Z sign (1 bit);
+- Or a special 3-bit “direction code” for axis-aligned normals.
 
-### Regular Case
+The decoder reconstructs the final Z component mathematically.
 
-```
-x = unpack(7 bits signed) / 64
-y = unpack(7 bits signed) / 64
-z_sign = unpack(1 bit)
-```
+---
 
-Z is reconstructed using:
+Each normal is encoded as one of two forms:
 
-```
-z = sqrt(1 - x² - y²)
-```
+1. **Special Direction Code (when X = -64)**
 
-If the square root becomes slightly negative due to precision loss, the vector is renormalized.
+    If the 7-bit X value equals -64, the normal does not contain numeric X/Y data.
+    Instead, the next 3 bits represent one of six cardinal directions:
+
+    | Direction Code | Normal Vector  | Meaning |
+    | -------------- | -------------- | ------- |
+    | 0              | ( +1,  0,  0 ) | +X axis |
+    | 1              | ( -1,  0,  0 ) | -X axis |
+    | 2              | (  0, +1,  0 ) | +Y axis |
+    | 3              | (  0, -1,  0 ) | -Y axis |
+    | 4              | (  0,  0, +1 ) | +Z axis |
+    | 5              | (  0,  0, -1 ) | -Z axis |
+
+    This special case is used when the normal is perfectly axis-aligned, saving storage space.
+
+---
+
+2. **Regular Spherical Encoding (any X ≠ -64)**
+
+    If X is not -64, the normal is encoded in compact spherical form:
+
+    | Component | Bits | Type  | Description    |
+    | --------- | ---- | ----- | -------------- |
+    | X         | 7    | sint7 | X / 64.0       |
+    | Y         | 7    | sint7 | Y / 64.0       |
+    | Z sign    | 1    | bit   | 0 = +Z, 1 = –Z |
+
+The decoder reconstructs the missing Z component using the unit-length constraint:
+
+```x² + y² + z² = 1 → z = sqrt(1 - x² - y²)```
+
+After computing Z, its sign is applied from the stored 1-bit flag.
+
+If rounding errors make `(1 - x² - y²)` negative (possible due to 7-bit precision), the decoder clamps or falls back to a safe value.
+
+---
+
+#### Bit allocation summary
+
+| Field Type                | Bits | Notes                   |
+| ------------------------- | ---- | ----------------------- |
+| Special-case flag (X=-64) | 7    | triggers direction mode |
+| Direction index           | 3    | only used if X = -64    |
+| X                         | 7    | signed, scaled by 1/64  |
+| Y                         | 7    | signed, scaled by 1/64  |
+| Z sign                    | 1    | 0 = +Z, 1 = -Z          |
+
+Total (regular): 15 bits per normal.
+Total (direction code): 10 bits per normal.
+
+---
+
+#### Why spherical compression?
+
+Storing X and Y with only 7 bits each reduces noise but saves a lot of space:
+
+- Float normal: `3 * 32 bits = 96 bits` (12 bytes).
+- MBAC spherical normal: `7 + 7 + 1 = 15 bits` (≈ 2 bytes).
+
+This gives 6x reduction in size, essential for early Java ME devices.
 
 ---
 
@@ -219,9 +277,16 @@ outZ = (m20 * x + m21 * y + m22 * z) >> 12 + m23
 
 ## Final Notes
 
-* MBAC uses a tightly packed bitstream, so decoding must be strictly sequential.
-* Many header fields are still unknown but handled safely.
-* All transformations must remain in fixed‑point; floating‑point math breaks bone chains.
-* Normals remain in floating-point because the engine uses them only for lighting.
+- MBAC uses a tightly packed bitstream, so decoding must be performed strictly in sequence.
 
-The next steps are to understand the MTRA file format and fully refactor the converter.
+- Several header fields remain undocumented, but all of them are safely handled by the decoder.
+
+- All bone transformations must stay in fixed-point; using floating-point breaks parent–child accumulation.
+
+- Normal vectors are converted to floating-point after decoding because Mascot Capsule uses them only for lighting calculations.
+
+---
+
+## Next Steps
+
+The next steps are to fully map the MTRA animation format and perform a complete refactor of the converter with a cleaner architecture and modular decoding pipeline.
